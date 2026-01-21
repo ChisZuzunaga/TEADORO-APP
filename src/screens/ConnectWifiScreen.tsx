@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -6,7 +6,6 @@ import {
   TouchableOpacity,
   ScrollView,
   TextInput,
-  Alert,
   PermissionsAndroid,
   Platform,
   ActivityIndicator,
@@ -15,6 +14,8 @@ import { Ionicons, MaterialIcons, MaterialCommunityIcons } from '@expo/vector-ic
 import { useBluetooth } from '../contexts/BluetoothContext';
 import { BLE } from '../ble/bleUuids';
 import { fromBase64, toBase64 } from '../ble/base64';
+import ErrorModal from '../components/ErrorModal';
+import { InteractionManager } from 'react-native';
 
 // Intentar importar WifiManager, pero manejar si no está disponible (Expo Go)
 let WifiManager: any = null;
@@ -60,7 +61,8 @@ const mockNetworks: WifiNetwork[] = [
 export default function ConnectWifiScreen({ navigation, route }: any) {
   const { deviceId, deviceName } = route.params ?? {};
   const { bleManager } = useBluetooth();
-  
+  const pendingErrorRef = useRef<null | { title: string; message: string; type: 'error'|'warning'|'info' }>(null);
+  const [errorTick, setErrorTick] = useState(0);  
   const [selectedNetwork, setSelectedNetwork] = useState<string | null>(null);
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -68,12 +70,102 @@ export default function ConnectWifiScreen({ navigation, route }: any) {
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [wifiStatus, setWifiStatus] = useState<string>('');
+  const [connectedIp, setConnectedIp] = useState<string>('');
+  const isMountedRef = useRef(true);
+  const subscriptionRef = useRef<any>(null);
+  const errorShownRef = useRef(false);
+const lastWifiErrorRef = useRef(0);
+
+
+  // Estado para el modal de error
+  const [errorModal, setErrorModal] = useState({
+    visible: false,
+    title: '',
+    message: '',
+    type: 'error' as 'error' | 'warning' | 'info',
+  });
+
+  const showError = (
+  title: string,
+  message: string,
+  type: 'error' | 'warning' | 'info' = 'error'
+) => {
+  if (!isMountedRef.current) return;
+
+  // Evita spam de errores
+  if (type === 'error' && errorShownRef.current) return;
+
+  // (opcional) si ya hay uno pendiente, no lo pises
+  if (type === 'error' && pendingErrorRef.current) return;
+
+  pendingErrorRef.current = { title, message, type };
+  setErrorTick(t => t + 1);
+};
+
+
+const closeError = () => {
+  if (!isMountedRef.current) return;
+  errorShownRef.current = false;
+  pendingErrorRef.current = null;
+  setErrorModal(prev => ({ ...prev, visible: false }));
+};
+
+
+  useEffect(() => {
+  const pending = pendingErrorRef.current;
+  if (!pending || !isMountedRef.current) return;
+
+  const task = InteractionManager.runAfterInteractions(() => {
+    if (!isMountedRef.current) return;
+
+    const p = pendingErrorRef.current;
+    if (!p) return;
+
+    if (p.type === 'error') errorShownRef.current = true;
+
+    setErrorModal({
+      visible: true,
+      title: p.title,
+      message: p.message,
+      type: p.type,
+    });
+
+    pendingErrorRef.current = null;
+  });
+
+  return () => task.cancel();
+}, [errorTick]);
+
+
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+      if (subscriptionRef.current) {
+        try {
+          subscriptionRef.current.remove();
+        } catch (e) {
+          console.log('Error removiendo suscripción:', e);
+        }
+      }
+    };
+  }, []);
 
   // Escuchar estado del ESP32 por BLE
   useEffect(() => {
-    if (!deviceId || !bleManager) {
+    if (!deviceId || !bleManager || !isMountedRef.current) {
       console.log('⚠️ No hay deviceId o bleManager');
       return;
+    }
+
+    // Limpiar suscripción anterior si existe
+    if (subscriptionRef.current) {
+      try {
+        subscriptionRef.current.remove();
+      } catch (e) {
+        console.log('Error removiendo suscripción anterior:', e);
+      }
     }
 
     console.log('🔵 Suscribiendo a notificaciones BLE...');
@@ -81,61 +173,101 @@ export default function ConnectWifiScreen({ navigation, route }: any) {
     console.log('Service UUID:', BLE.SERVICE_UUID);
     console.log('Status Char UUID:', BLE.STATUS_CHAR_UUID);
 
-    const subscription = bleManager.monitorCharacteristicForDevice(
+    subscriptionRef.current = bleManager.monitorCharacteristicForDevice(
       deviceId,
       BLE.SERVICE_UUID,
       BLE.STATUS_CHAR_UUID,
       (error, characteristic) => {
-        if (error) {
-          console.log('❌ Monitor error:', error.message);
-          return;
-        }
-        
-        const b64 = characteristic?.value;
-        if (!b64) {
-          console.log('⚠️ No hay valor en la característica');
-          return;
-        }
-
-        console.log('📦 Valor Base64 recibido:', b64);
-        
         try {
-          const msg = fromBase64(b64);
-          console.log('📨 Mensaje decodificado completo:', msg);
-          console.log('📏 Longitud del mensaje:', msg.length);
+          if (!isMountedRef.current) return;
+          
+          if (error) {
+            console.log('❌ Monitor error:', error.message);
+            return;
+          }
+          
+          const b64 = characteristic?.value;
+          if (!b64) {
+            console.log('⚠️ No hay valor en la característica');
+            return;
+          }
 
-          const obj = JSON.parse(msg);
-          console.log('✅ JSON parseado:', obj);
+          console.log('📦 Valor Base64 recibido:', b64);
+          
+          try {
+            const msg = fromBase64(b64);
+            console.log('📨 Mensaje decodificado completo:', msg);
+            console.log('📏 Longitud del mensaje:', msg.length);
+
+            const obj = JSON.parse(msg);
+            console.log('✅ JSON parseado:', obj);
+
+            if (!isMountedRef.current) return;
 
           if (obj?.type === 'wifi') {
-            if (obj.state === 'received') setWifiStatus('✅ Credenciales recibidas');
-            if (obj.state === 'connecting') setWifiStatus('⏳ Conectando a WiFi...');
-            if (obj.state === 'connected') {
-              setWifiStatus(`✅ Conectado. IP: ${obj.ip}`);
-              Alert.alert('✅ ESP32 conectado', `IP: ${obj.ip}`);
+            if (obj.state === 'received') {
+              setWifiStatus('✅ Credenciales recibidas');
+            } else if (obj.state === 'connecting') {
+              setWifiStatus('⏳ Conectando a WiFi...');
+            } else if (obj.state === 'connected') {
+              const ip = obj.ip || 'N/A';
+              setWifiStatus(`✅ Conectado. IP: ${ip}`);
+              setConnectedIp(ip);
+              
+              // Navegar a la pantalla de éxito
+              setTimeout(() => {
+                if (isMountedRef.current) {
+                  navigation.navigate('ConnectionSuccess', {
+                    deviceName: deviceName || 'Teddy-ESP32',
+                    ipAddress: ip,
+                  });
+                }
+              }, 800);
+            } else if (obj.state === 'error') {
+                const reason = obj.reason || 'Desconocido';
+                setWifiStatus(`❌ Error: ${reason}`);
+
+                showError(
+                    'Error de Conexión WiFi',
+                    `El dispositivo no pudo conectarse a la red.\n\nRazón: ${reason}\n\nVerifica la contraseña y vuelve a intentarlo.`,
+                    'error'
+                );
             }
-            if (obj.state === 'error') {
-              setWifiStatus(`❌ Error: ${obj.reason}`);
-              Alert.alert('❌ Error WiFi', `Razón: ${obj.reason}`);
-            }
+
           } else if (obj?.type === 'ble' && obj.state === 'connected') {
             setWifiStatus('📶 BLE conectado. Listo para configurar WiFi.');
           } else if (obj?.type === 'boot') {
             setWifiStatus('🔌 ESP32 listo');
           }
         } catch (parseError: any) {
+          if (!isMountedRef.current) return;
           console.log('❌ Error parseando JSON:', parseError.message);
-          console.log('📝 Mensaje raw que falló:', fromBase64(b64));
+          try {
+            console.log('📝 Mensaje raw que falló:', fromBase64(b64));
+          } catch (e) {
+            console.log('No se pudo decodificar mensaje');
+          }
           setWifiStatus('⚠️ Respuesta recibida (formato incorrecto)');
+        }
+        } catch (outerError: any) {
+          console.log('🔥 Error crítico en callback BLE:', outerError);
+          console.log('🔥 Stack trace:', outerError.stack);
         }
       }
     );
 
     return () => {
       console.log('🔴 Desuscribiendo de notificaciones BLE');
-      subscription?.remove();
+      if (subscriptionRef.current) {
+        try {
+          subscriptionRef.current.remove();
+          subscriptionRef.current = null;
+        } catch (e) {
+          console.log('Error en cleanup de suscripción:', e);
+        }
+      }
     };
-  }, [deviceId, bleManager]);
+  }, [deviceId, bleManager, navigation, deviceName]);
 
   useEffect(() => {
     requestPermissionsAndScan();
@@ -155,7 +287,11 @@ export default function ConnectWifiScreen({ navigation, route }: any) {
         if (allGranted) {
           scanNetworks();
         } else {
-          Alert.alert('Permisos requeridos', 'La app necesita permisos para escanear redes WiFi');
+          showError(
+            'Permisos Requeridos',
+            'La app necesita permisos de ubicación para escanear redes WiFi.',
+            'warning'
+          );
           setLoading(false);
         }
       } else {
@@ -208,12 +344,20 @@ export default function ConnectWifiScreen({ navigation, route }: any) {
 
   const handleConnect = async () => {
     if (!selectedNetwork) {
-      Alert.alert('Falta red', 'Selecciona una red WiFi.');
+      showError(
+        'Falta Seleccionar Red',
+        'Por favor selecciona una red WiFi de la lista.',
+        'warning'
+      );
       return;
     }
 
     if (!deviceId || !bleManager) {
-      Alert.alert('Error', 'No hay dispositivo BLE conectado.');
+      showError(
+        'Error de Conexión',
+        'No hay dispositivo BLE conectado. Por favor vuelve atrás e intenta conectarte de nuevo.',
+        'error'
+      );
       return;
     }
 
@@ -251,7 +395,12 @@ export default function ConnectWifiScreen({ navigation, route }: any) {
       console.log('❌ BLE send error:', error);
       console.log('Error completo:', JSON.stringify(error, null, 2));
       setWifiStatus('❌ Error al enviar por BLE');
-      Alert.alert('Error BLE', error?.message ?? 'No se pudieron enviar credenciales.');
+      
+      showError(
+        'Error BLE',
+        `No se pudieron enviar las credenciales al dispositivo.\n\nError: ${error?.message || 'Desconocido'}\n\nVerifica que el dispositivo siga conectado.`,
+        'error'
+      );
     }
   };
 
@@ -453,7 +602,7 @@ export default function ConnectWifiScreen({ navigation, route }: any) {
           onPress={handleConnect}
           disabled={!selectedNetwork || !password}
         >
-          <Text style={styles.connectButtonText}>Connect to Internet →</Text>
+          <Text style={styles.connectButtonText}>Connect to Internet</Text>
         </TouchableOpacity>
 
         {/* Join Hidden Network */}
@@ -462,6 +611,15 @@ export default function ConnectWifiScreen({ navigation, route }: any) {
           <Text style={styles.hiddenNetworkText}>Join hidden network</Text>
         </TouchableOpacity>
       </ScrollView>
+
+      {/* Error Modal */}
+      <ErrorModal
+        visible={errorModal.visible}
+        title={errorModal.title}
+        message={errorModal.message}
+        type={errorModal.type}
+        onClose={closeError}
+      />
     </View>
   );
 }

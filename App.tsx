@@ -11,6 +11,7 @@ import { BluetoothProvider } from "./src/contexts/BluetoothContext";
 import TestScreen from "./src/screens/TestScreen";
 import ConnectWifiScreen from "./src/screens/ConnectWifiScreen";
 import ConnectDevice from "./src/screens/ConnectDeviceScreen";
+import ConnectionSuccessScreen from "./src/screens/ConnectionSuccessScreen";
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
@@ -23,6 +24,7 @@ export default function App() {
             <Stack.Navigator screenOptions={{ headerShown: false }}>
               <Stack.Screen name="ConnectDevice" component={ConnectDevice} />
               <Stack.Screen name="ConnectWifi" component={ConnectWifiScreen} />
+              <Stack.Screen name="ConnectionSuccess" component={ConnectionSuccessScreen} />
               <Stack.Screen name="Test" component={TestScreen} />
             </Stack.Navigator>
           </NavigationContainer>

@@ -9,12 +9,12 @@ import {
   Easing,
   PermissionsAndroid,
   Platform,
-  Alert,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { BleManager, Device as BleDevice } from 'react-native-ble-plx';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useBluetooth } from '../contexts/BluetoothContext';
+import ErrorModal from '../components/ErrorModal';
 
 interface Device {
   id: string;
@@ -28,6 +28,30 @@ export default function ConnectDeviceScreen({ navigation }: any) {
   const [connectedDevice, setConnectedDevice] = useState<string | null>(null);
   const scanAnimation = useRef(new Animated.Value(0)).current;
   const pulseAnimation = useRef(new Animated.Value(1)).current;
+
+  // Estado para el modal de error
+  const [errorModal, setErrorModal] = useState({
+    visible: false,
+    title: '',
+    message: '',
+    type: 'error' as 'error' | 'warning' | 'info',
+  });
+
+  const showError = (title: string, message: string, type: 'error' | 'warning' | 'info' = 'error') => {
+    setErrorModal({
+      visible: true,
+      title,
+      message,
+      type,
+    });
+  };
+
+  const closeError = () => {
+    setErrorModal({
+      ...errorModal,
+      visible: false,
+    });
+  };
   const { bleManager } = useBluetooth();
   const bleManagerRef = useRef(bleManager);
 
@@ -74,7 +98,7 @@ export default function ConnectDeviceScreen({ navigation }: any) {
       if (Platform.OS === 'android') {
         try {
           // Intentar solicitar permisos para Android 12+
-          const permissions = [];
+          const permissions: any[] = [];
           
           // Para Android 12+ (API 31+) necesitamos BLUETOOTH_SCAN y BLUETOOTH_CONNECT
           if (PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN) {
@@ -88,7 +112,7 @@ export default function ConnectDeviceScreen({ navigation }: any) {
           permissions.push(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
 
           if (permissions.length > 0) {
-            const results = await PermissionsAndroid.requestMultiple(permissions);
+            const results = await PermissionsAndroid.requestMultiple(permissions as any);
             console.log('Permission results:', results);
           }
         } catch (permError) {
@@ -101,7 +125,11 @@ export default function ConnectDeviceScreen({ navigation }: any) {
       startScanning();
     } catch (error) {
       console.error('Error in requestPermissionsAndStartScan:', error);
-      Alert.alert('Error', 'Hubo un problema al inicializar Bluetooth. Intenta nuevamente.');
+      showError(
+        'Error Bluetooth',
+        'Hubo un problema al inicializar Bluetooth. Verifica que esté encendido e intenta nuevamente.',
+        'error'
+      );
     }
   };
 
@@ -153,9 +181,10 @@ export default function ConnectDeviceScreen({ navigation }: any) {
       bleManagerRef.current?.stopDeviceScan();
       setIsScanning(false);
 
-      Alert.alert(
-        'Conectando',
-        `Estableciendo conexión con ${deviceName}...`
+      showError(
+        'Conectando...',
+        `Estableciendo conexión con ${deviceName}. Por favor espera.`,
+        'info'
       );
 
       // Conectar al dispositivo BLE
@@ -180,34 +209,23 @@ export default function ConnectDeviceScreen({ navigation }: any) {
         
         setConnectedDevice(deviceId);
         
-        Alert.alert(
-          'Dispositivo Conectado',
-          `${deviceName} conectado exitosamente.\n\nAhora puedes configurar la red WiFi del dispositivo.`,
-          [
-            {
-              text: 'Más tarde',
-              style: 'cancel',
-            },
-            {
-              text: 'Configurar WiFi',
-              onPress: () => {
-                // Navegar con la información del dispositivo conectado
-                navigation.navigate('ConnectWifi', {
-                  deviceId: deviceId,
-                  deviceName: deviceName,
-                });
-              },
-            },
-          ]
-        );
+        // Cerrar modal de "Conectando" y navegar directamente
+        closeError();
+        
+        // Navegar con la información del dispositivo conectado
+        navigation.navigate('ConnectWifi', {
+          deviceId: deviceId,
+          deviceName: deviceName,
+        });
       }
     } catch (error: any) {
       console.error('Connection error:', error);
       setConnectedDevice(null);
       
-      Alert.alert(
+      showError(
         'Error de Conexión',
-        `No se pudo conectar a ${deviceName}.\n\nError: ${error.message || 'Desconocido'}\n\nAsegúrate de que:\n• El dispositivo está encendido\n• El dispositivo está en modo de vinculación\n• No está conectado a otro teléfono`
+        `No se pudo conectar a ${deviceName}.\n\nError: ${error.message || 'Desconocido'}\n\nAsegúrate de que:\n• El dispositivo está encendido\n• El dispositivo está en modo de vinculación\n• No está conectado a otro teléfono`,
+        'error'
       );
     }
   };
@@ -216,7 +234,11 @@ export default function ConnectDeviceScreen({ navigation }: any) {
     try {
       await bleManagerRef.current?.cancelDeviceConnection(deviceId);
       setConnectedDevice(null);
-      Alert.alert('Desconectado', 'Dispositivo desconectado exitosamente');
+      showError(
+        'Desconectado',
+        'Dispositivo desconectado exitosamente.',
+        'info'
+      );
     } catch (error) {
       console.error('Disconnection error:', error);
       setConnectedDevice(null);
@@ -437,6 +459,15 @@ export default function ConnectDeviceScreen({ navigation }: any) {
           <Text style={styles.troubleText}>Trouble connecting?</Text>
         </TouchableOpacity>
       </ScrollView>
+
+      {/* Error Modal */}
+      <ErrorModal
+        visible={errorModal.visible}
+        title={errorModal.title}
+        message={errorModal.message}
+        type={errorModal.type}
+        onClose={closeError}
+      />
     </View>
   );
 }

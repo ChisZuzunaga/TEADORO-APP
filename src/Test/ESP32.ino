@@ -3,19 +3,38 @@
 
 // ================= UUIDs BLE =================
 static const char* SERVICE_UUID        = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
-static const char* WIFI_CRED_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // WRITE
-static const char* STATUS_CHAR_UUID    = "caa1f2a0-9f7b-4d3f-b1d2-0d3c5f7c9a10"; // NOTIFY
+static const char* WIFI_CRED_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // WRITE / WRITE_NR
+static const char* STATUS_CHAR_UUID    = "caa1f2a0-9f7b-4d3f-b1d2-0d3c5f7c9a10"; // NOTIFY / READ
 
-// ================= BLE Globals =================
 static NimBLECharacteristic* gStatusChar = nullptr;
 static bool gDeviceConnected = false;
 
-// ================= WiFi Control (anti "cannot set config") =================
-static volatile bool gWifiConnecting = false;
-static String gPendingSsid = "";
-static String gPendingPass = "";
+// ====== WiFi state machine (NO bloquear BLE) ======
+enum WifiState {
+  WIFI_IDLE,
+  WIFI_STARTING,
+  WIFI_CONNECTING,
+  WIFI_CONNECTED,
+  WIFI_FAILED
+};
 
-// ------------------------------------------------
+static volatile bool wifiConnectRequested = false;
+static WifiState wifiState = WIFI_IDLE;
+
+static String reqSsid = "";
+static String reqPass = "";
+
+static unsigned long wifiStartMs = 0;
+static const unsigned long WIFI_TIMEOUT_MS = 30000;
+static wl_status_t lastWifiStatus = WL_IDLE_STATUS;
+
+// Forward declarations
+static void notifyStatus(const String& json);
+static void hardStopWiFi();
+static bool extractJsonValue(const String& src, const String& key, String& out);
+static void clearWiFiCredentials();
+
+// ---------- BLE notify ----------
 static void notifyStatus(const String& json) {
   if (gStatusChar && gDeviceConnected) {
     gStatusChar->setValue((uint8_t*)json.c_str(), json.length());
@@ -23,17 +42,15 @@ static void notifyStatus(const String& json) {
   }
 }
 
-// Parse simple de {"ssid":"X","pass":"Y"} sin ArduinoJson
+// Parse simple de {"ssid":"X","pass":"Y"}
 static bool extractJsonValue(const String& src, const String& key, String& out) {
   int k = src.indexOf("\"" + key + "\"");
   if (k < 0) return false;
-
   int colon = src.indexOf(':', k);
   if (colon < 0) return false;
 
   int firstQuote = src.indexOf('\"', colon + 1);
   if (firstQuote < 0) return false;
-
   int secondQuote = src.indexOf('\"', firstQuote + 1);
   if (secondQuote < 0) return false;
 
@@ -41,56 +58,16 @@ static bool extractJsonValue(const String& src, const String& key, String& out) 
   return true;
 }
 
-static void connectToWiFiBlocking(const String& ssid, const String& pass) {
-  gWifiConnecting = true;
-
-  notifyStatus("{\"type\":\"wifi\",\"state\":\"connecting\"}");
-
-  WiFi.mode(WIFI_STA);
-
-  // Detener intento anterior y limpiar config
+static void hardStopWiFi() {
   WiFi.disconnect(true, true);
-  delay(500);
-
-  Serial.print("Connecting to SSID: ");
-  Serial.println(ssid);
-
-  WiFi.begin(ssid.c_str(), pass.c_str());
-
-  const unsigned long start = millis();
-  const unsigned long timeoutMs = 25000;
-
-  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
-    delay(250);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    String ip = WiFi.localIP().toString();
-    Serial.print("WiFi connected, IP: ");
-    Serial.println(ip);
-
-    notifyStatus("{\"type\":\"wifi\",\"state\":\"connected\",\"ip\":\"" + ip + "\"}");
-  } else {
-    Serial.print("WiFi failed. status=");
-    Serial.println((int)WiFi.status());
-
-    notifyStatus("{\"type\":\"wifi\",\"state\":\"error\",\"reason\":\"timeout_or_auth\"}");
-    WiFi.disconnect(true, true);
-  }
-
-  gWifiConnecting = false;
-
-  // Si llegó una nueva solicitud mientras conectaba, reintenta con la última
-  if (gPendingSsid.length() > 0) {
-    String nextSsid = gPendingSsid;
-    String nextPass = gPendingPass;
-    gPendingSsid = "";
-    gPendingPass = "";
-    connectToWiFiBlocking(nextSsid, nextPass);
-  }
+  delay(150);
+  WiFi.mode(WIFI_OFF);
+  delay(150);
+  WiFi.mode(WIFI_STA);
+  delay(150);
 }
 
-// ================= Callbacks NimBLE-Arduino 2.x =================
+// ---------- NimBLE callbacks ----------
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     gDeviceConnected = true;
@@ -99,7 +76,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
     gDeviceConnected = false;
-    NimBLEDevice::startAdvertising(); // reanuncia para reconectar
+    NimBLEDevice::startAdvertising();
   }
 };
 
@@ -119,24 +96,76 @@ class WifiCredCallbacks : public NimBLECharacteristicCallbacks {
       notifyStatus("{\"type\":\"wifi\",\"state\":\"error\",\"reason\":\"missing_ssid\"}");
       return;
     }
-    if (!okPass) pass = ""; // permitir redes abiertas
+    if (!okPass) pass = "";
+
+    // Guardar solicitud y procesar fuera del callback
+    reqSsid = ssid;
+    reqPass = pass;
+    wifiConnectRequested = true;
 
     notifyStatus("{\"type\":\"wifi\",\"state\":\"received\"}");
-
-    // Si ya está conectando, guardar la última solicitud y no pisar config
-    if (gWifiConnecting) {
-      gPendingSsid = ssid;
-      gPendingPass = pass;
-      notifyStatus("{\"type\":\"wifi\",\"state\":\"queued\"}");
-      return;
-    }
-
-    connectToWiFiBlocking(ssid, pass);
   }
 };
 
+// ---------- WiFi state machine tick ----------
+static void wifiTick() {
+  // Si llega una nueva solicitud, la tomamos y reiniciamos el proceso
+  if (wifiConnectRequested) {
+    wifiConnectRequested = false;
+
+    // Si estaba conectando, paramos limpio para evitar "cannot set config"
+    hardStopWiFi();
+
+    Serial.print("Connecting to SSID: ");
+    Serial.println(reqSsid);
+
+    notifyStatus("{\"type\":\"wifi\",\"state\":\"connecting\"}");
+
+    WiFi.begin(reqSsid.c_str(), reqPass.c_str());
+
+    wifiState = WIFI_CONNECTING;
+    wifiStartMs = millis();
+    lastWifiStatus = WL_IDLE_STATUS;
+  }
+
+  if (wifiState == WIFI_CONNECTING) {
+    wl_status_t st = WiFi.status();
+
+    if (st != lastWifiStatus) {
+      lastWifiStatus = st;
+      Serial.print("WiFi status changed: ");
+      Serial.println((int)st);
+    }
+
+    if (st == WL_CONNECTED) {
+      String ip = WiFi.localIP().toString();
+      Serial.print("WiFi connected, IP: ");
+      Serial.println(ip);
+
+      notifyStatus("{\"type\":\"wifi\",\"state\":\"connected\",\"ip\":\"" + ip + "\"}");
+      wifiState = WIFI_CONNECTED;
+      return;
+    }
+
+    // Timeout
+    if (millis() - wifiStartMs > WIFI_TIMEOUT_MS) {
+      Serial.print("WiFi failed. status=");
+      Serial.println((int)st);
+
+      hardStopWiFi();
+      notifyStatus("{\"type\":\"wifi\",\"state\":\"error\",\"reason\":\"timeout_or_auth\"}");
+      wifiState = WIFI_FAILED;
+      return;
+    }
+  }
+}
+
+// ---------- Setup / Loop ----------
 void setup() {
   Serial.begin(115200);
+  delay(200);
+
+  WiFi.mode(WIFI_OFF);
   delay(200);
 
   String bleName = "Teddy-ESP32";
@@ -149,14 +178,12 @@ void setup() {
 
   NimBLEService* service = server->createService(SERVICE_UUID);
 
-  // WRITE credenciales
   NimBLECharacteristic* wifiCredChar = service->createCharacteristic(
     WIFI_CRED_CHAR_UUID,
     NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
   );
   wifiCredChar->setCallbacks(new WifiCredCallbacks());
 
-  // NOTIFY estado
   gStatusChar = service->createCharacteristic(
     STATUS_CHAR_UUID,
     NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
@@ -165,7 +192,6 @@ void setup() {
 
   service->start();
 
-  // Advertising compatible con tu versión (sin setScanResponse(true))
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(SERVICE_UUID);
 
@@ -184,5 +210,25 @@ void setup() {
 }
 
 void loop() {
-  delay(50);
+  wifiTick();      // <-- importante: procesa WiFi sin bloquear BLE
+  delay(20);
+
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'R') {
+      clearWiFiCredentials();
+      Serial.println("WiFi reset done");
+      ESP.restart();
+    }
+  }
+}
+
+static void clearWiFiCredentials() {
+  Serial.println("Clearing WiFi credentials...");
+  WiFi.disconnect(true, true);
+  delay(300);
+  WiFi.mode(WIFI_OFF);
+  delay(300);
+  WiFi.mode(WIFI_STA);
+  delay(300);
 }
