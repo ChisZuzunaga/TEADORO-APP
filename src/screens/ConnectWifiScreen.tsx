@@ -12,6 +12,9 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import { Ionicons, MaterialIcons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { useBluetooth } from '../contexts/BluetoothContext';
+import { BLE } from '../ble/bleUuids';
+import { fromBase64, toBase64 } from '../ble/base64';
 
 // Intentar importar WifiManager, pero manejar si no está disponible (Expo Go)
 let WifiManager: any = null;
@@ -54,13 +57,85 @@ const mockNetworks: WifiNetwork[] = [
   },
 ];
 
-export default function ConnectWifiScreen({ navigation }: any) {
+export default function ConnectWifiScreen({ navigation, route }: any) {
+  const { deviceId, deviceName } = route.params ?? {};
+  const { bleManager } = useBluetooth();
+  
   const [selectedNetwork, setSelectedNetwork] = useState<string | null>(null);
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [networks, setNetworks] = useState<WifiNetwork[]>([]);
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
+  const [wifiStatus, setWifiStatus] = useState<string>('');
+
+  // Escuchar estado del ESP32 por BLE
+  useEffect(() => {
+    if (!deviceId || !bleManager) {
+      console.log('⚠️ No hay deviceId o bleManager');
+      return;
+    }
+
+    console.log('🔵 Suscribiendo a notificaciones BLE...');
+    console.log('Device ID:', deviceId);
+    console.log('Service UUID:', BLE.SERVICE_UUID);
+    console.log('Status Char UUID:', BLE.STATUS_CHAR_UUID);
+
+    const subscription = bleManager.monitorCharacteristicForDevice(
+      deviceId,
+      BLE.SERVICE_UUID,
+      BLE.STATUS_CHAR_UUID,
+      (error, characteristic) => {
+        if (error) {
+          console.log('❌ Monitor error:', error.message);
+          return;
+        }
+        
+        const b64 = characteristic?.value;
+        if (!b64) {
+          console.log('⚠️ No hay valor en la característica');
+          return;
+        }
+
+        console.log('📦 Valor Base64 recibido:', b64);
+        
+        try {
+          const msg = fromBase64(b64);
+          console.log('📨 Mensaje decodificado completo:', msg);
+          console.log('📏 Longitud del mensaje:', msg.length);
+
+          const obj = JSON.parse(msg);
+          console.log('✅ JSON parseado:', obj);
+
+          if (obj?.type === 'wifi') {
+            if (obj.state === 'received') setWifiStatus('✅ Credenciales recibidas');
+            if (obj.state === 'connecting') setWifiStatus('⏳ Conectando a WiFi...');
+            if (obj.state === 'connected') {
+              setWifiStatus(`✅ Conectado. IP: ${obj.ip}`);
+              Alert.alert('✅ ESP32 conectado', `IP: ${obj.ip}`);
+            }
+            if (obj.state === 'error') {
+              setWifiStatus(`❌ Error: ${obj.reason}`);
+              Alert.alert('❌ Error WiFi', `Razón: ${obj.reason}`);
+            }
+          } else if (obj?.type === 'ble' && obj.state === 'connected') {
+            setWifiStatus('📶 BLE conectado. Listo para configurar WiFi.');
+          } else if (obj?.type === 'boot') {
+            setWifiStatus('🔌 ESP32 listo');
+          }
+        } catch (parseError: any) {
+          console.log('❌ Error parseando JSON:', parseError.message);
+          console.log('📝 Mensaje raw que falló:', fromBase64(b64));
+          setWifiStatus('⚠️ Respuesta recibida (formato incorrecto)');
+        }
+      }
+    );
+
+    return () => {
+      console.log('🔴 Desuscribiendo de notificaciones BLE');
+      subscription?.remove();
+    };
+  }, [deviceId, bleManager]);
 
   useEffect(() => {
     requestPermissionsAndScan();
@@ -132,23 +207,51 @@ export default function ConnectWifiScreen({ navigation }: any) {
   };
 
   const handleConnect = async () => {
-    if (!selectedNetwork || !password) return;
+    if (!selectedNetwork) {
+      Alert.alert('Falta red', 'Selecciona una red WiFi.');
+      return;
+    }
+
+    if (!deviceId || !bleManager) {
+      Alert.alert('Error', 'No hay dispositivo BLE conectado.');
+      return;
+    }
 
     try {
-      // Si no hay WifiManager disponible (Expo Go), simular conexión
-      if (!WifiManager) {
-        console.log('Simulating WiFi connection for Expo Go');
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        Alert.alert('Conectado (Simulado)', `Conectado exitosamente a ${selectedNetwork}\n\nNota: Esto es una simulación. Compila la app nativamente para conectarte realmente.`);
-        return;
-      }
+      setWifiStatus('📤 Enviando credenciales al ESP32...');
 
-      // Conexión real con WifiManager
-      await WifiManager.connectToProtectedSSID(selectedNetwork, password, false, false);
-      Alert.alert('Conectado', `Conectado exitosamente a ${selectedNetwork}`);
-    } catch (error) {
-      console.error('Error connecting:', error);
-      Alert.alert('Error', 'No se pudo conectar a la red. Verifica la contraseña.');
+      // Asegurar que servicios/características estén descubiertos
+      console.log('🔍 Descubriendo servicios...');
+      await bleManager.discoverAllServicesAndCharacteristicsForDevice(deviceId);
+      console.log('✅ Servicios descubiertos');
+
+      // Payload JSON (como espera el ESP32)
+      const payload = JSON.stringify({
+        ssid: selectedNetwork,
+        pass: password ?? '',
+      });
+
+      console.log('📝 Payload a enviar:', payload);
+      const b64Payload = toBase64(payload);
+      console.log('📦 Payload Base64:', b64Payload);
+      console.log('📏 Longitud Base64:', b64Payload.length);
+
+      // Write con response (más confiable)
+      console.log('📤 Escribiendo característica BLE...');
+      await bleManager.writeCharacteristicWithResponseForDevice(
+        deviceId,
+        BLE.SERVICE_UUID,
+        BLE.WIFI_CRED_CHAR_UUID,
+        b64Payload
+      );
+
+      console.log('✅ Credenciales enviadas por BLE');
+      setWifiStatus('✅ Credenciales enviadas. Esperando conexión...');
+    } catch (error: any) {
+      console.log('❌ BLE send error:', error);
+      console.log('Error completo:', JSON.stringify(error, null, 2));
+      setWifiStatus('❌ Error al enviar por BLE');
+      Alert.alert('Error BLE', error?.message ?? 'No se pudieron enviar credenciales.');
     }
   };
 
@@ -192,6 +295,19 @@ export default function ConnectWifiScreen({ navigation }: any) {
       </View>
 
       <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
+        {/* Device Info Banner */}
+        {deviceId && (
+          <View style={styles.deviceBanner}>
+            <Text style={styles.deviceBannerTitle}>DISPOSITIVO CONECTADO</Text>
+            <Text style={styles.deviceBannerValue}>
+              {deviceName ?? 'ESP32'}
+            </Text>
+            {!!wifiStatus && (
+              <Text style={styles.deviceBannerStatus}>{wifiStatus}</Text>
+            )}
+          </View>
+        )}
+
         {/* Progress Bar */}
         <View style={styles.progressBar}>
           <View style={styles.progressFill} />
@@ -246,7 +362,10 @@ export default function ConnectWifiScreen({ navigation }: any) {
                       styles.networkItem,
                       isSelected && styles.networkItemSelected
                     ]}
-                    onPress={() => setSelectedNetwork(network.SSID)}
+                    onPress={() => {
+                      setSelectedNetwork(network.SSID);
+                      setPassword('');
+                    }}
                   >
                     <View style={styles.networkInfo}>
                       <View style={[
@@ -384,6 +503,33 @@ const styles = StyleSheet.create({
   },
   scrollContent: {
     paddingBottom: 40,
+  },
+  deviceBanner: {
+    backgroundColor: '#e8f5f7',
+    marginHorizontal: 20,
+    marginTop: 20,
+    marginBottom: 10,
+    padding: 12,
+    borderRadius: 8,
+    borderLeftWidth: 4,
+    borderLeftColor: '#5dd5e1',
+  },
+  deviceBannerTitle: {
+    fontSize: 12,
+    color: '#999',
+    marginBottom: 4,
+    fontWeight: '600',
+  },
+  deviceBannerValue: {
+    fontSize: 14,
+    color: '#333',
+    fontWeight: '600',
+    marginBottom: 6,
+  },
+  deviceBannerStatus: {
+    fontSize: 13,
+    color: '#666',
+    marginTop: 4,
   },
   progressBar: {
     height: 3,

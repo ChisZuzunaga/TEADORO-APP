@@ -166,6 +166,14 @@ export default function ConnectDeviceScreen({ navigation }: any) {
       if (device) {
         console.log('Device connected:', deviceId);
         
+        // Solicitar MTU más grande para mensajes largos (512 bytes)
+        try {
+          const mtu = await device.requestMTU(512);
+          console.log('MTU negociado:', mtu);
+        } catch (mtuError) {
+          console.log('MTU request failed, usando default:', mtuError);
+        }
+        
         // Descubrir servicios y características
         await device.discoverAllServicesAndCharacteristics();
         console.log('Services discovered');
